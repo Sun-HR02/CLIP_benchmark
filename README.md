@@ -7,6 +7,7 @@ retrieval, and captioning.
 
 - Results of OpenCLIP models on 38 datasets can be seen here: <https://github.com/mlfoundations/open_clip/blob/main/docs/openclip_results.csv>.
 - Results from "Reproducible scaling laws for contrastive language-image learning" [[arXiv]](https://arxiv.org/abs/2212.07143) can be seen here: <https://github.com/LAION-AI/scaling-laws-openclip>
+- - Results from "Scaling Laws for Robust Comparison of Open Foundation Language-Vision Models and Datasets"  [[arXiv:2506.04598]](https://arxiv.org/abs/2506.04598) can be seen here: <https://github.com/LAION-AI/scaling-laws-for-comparison>
 - Additional results are available in <https://github.com/LAION-AI/CLIP_benchmark_results>.
 
 ## Features
