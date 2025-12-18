@@ -218,14 +218,12 @@ def evaluate(model, dataloader, tokenizer, classnames, templates, device, amp=Tr
     
     # 如果启用剪枝，在评估前应用到模型
     if pruning_config is not None:
-        if verbose:
-            print(f"Applying token pruning: k_anchors={pruning_config['k_anchors']}, "
-                  f"top_m={pruning_config['top_m']}, alpha={pruning_config['alpha']}")
         apply_pruning_to_model(
             model,
             k_anchors=pruning_config['k_anchors'],
             top_m=pruning_config['top_m'],
-            alpha=pruning_config['alpha']
+            alpha=pruning_config['alpha'],
+            verbose=verbose
         )
 
     logits, target = run_classification(model, classifier, dataloader, device, amp=amp, pruning_config=pruning_config)

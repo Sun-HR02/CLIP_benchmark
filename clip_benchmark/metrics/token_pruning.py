@@ -4,6 +4,37 @@ Implements attention-based token selection to reduce computational cost.
 """
 import torch
 import torch.nn.functional as F
+import numpy as np
+
+
+def compute_attention_from_features(features, num_heads=12):
+    """
+    从特征直接计算注意力权重（简化版本，用于演示）
+    
+    Args:
+        features: token特征 [batch_size, seq_len, dim]
+        num_heads: 注意力头数量
+    
+    Returns:
+        attention_weights: 注意力权重 [batch_size, num_heads, seq_len, seq_len]
+    """
+    batch_size, seq_len, dim = features.shape
+    head_dim = dim // num_heads
+    
+    # 简化：使用特征相似度作为注意力的近似
+    # 归一化特征
+    features_norm = F.normalize(features, dim=-1)
+    
+    # 计算相似度矩阵
+    attention = torch.bmm(features_norm, features_norm.transpose(1, 2))  # [B, seq_len, seq_len]
+    
+    # 应用softmax
+    attention = F.softmax(attention / np.sqrt(head_dim), dim=-1)
+    
+    # 扩展到多头（简化：所有头使用相同的注意力）
+    attention = attention.unsqueeze(1).expand(-1, num_heads, -1, -1)
+    
+    return attention
 
 
 def select_anchor_tokens(attention_weights, k):
@@ -200,36 +231,28 @@ class PrunedVisionEncoder:
     """
     包装CLIP模型的视觉编码器，添加token剪枝功能
     """
-    def __init__(self, model, k_anchors=10, top_m=50, alpha=0.5):
+    def __init__(self, model, k_anchors=10, top_m=50, alpha=0.5, verbose=False):
         self.model = model
         self.k_anchors = k_anchors
         self.top_m = top_m
         self.alpha = alpha
+        self.verbose = verbose
         self.original_encode_image = model.encode_image
         
         # 用于存储中间结果
-        self.attention_weights = None
         self.intermediate_features = None
+        self.pruning_applied = False
         
-    def _attention_hook(self, module, input, output):
-        """Hook函数用于捕获注意力权重"""
-        # 根据不同的模型架构，注意力权重的位置可能不同
-        if isinstance(output, tuple):
-            # 有些模型返回 (output, attention_weights)
-            if len(output) > 1 and isinstance(output[1], torch.Tensor):
-                self.attention_weights = output[1]
-        elif hasattr(output, 'attentions'):
-            self.attention_weights = output.attentions
-            
     def _feature_hook(self, module, input, output):
-        """Hook函数用于捕获中间特征"""
+        """Hook函数用于捕获transformer最后一层的输出特征"""
         if isinstance(output, torch.Tensor):
-            self.intermediate_features = output
+            # 保存特征 [batch, seq_len, dim]
+            self.intermediate_features = output.clone()
         elif isinstance(output, tuple) and len(output) > 0:
-            self.intermediate_features = output[0]
+            self.intermediate_features = output[0].clone()
     
     def register_hooks(self):
-        """注册hooks到模型"""
+        """注册hooks到模型的最后一个transformer block"""
         hooks = []
         if hasattr(self.model, 'visual'):
             visual = self.model.visual
@@ -237,18 +260,18 @@ class PrunedVisionEncoder:
             # 尝试找到transformer blocks
             if hasattr(visual, 'transformer'):
                 if hasattr(visual.transformer, 'resblocks'):
-                    # OpenCLIP style
-                    last_block = visual.transformer.resblocks[-1]
-                    if hasattr(last_block, 'attn'):
-                        hooks.append(last_block.attn.register_forward_hook(self._attention_hook))
-                    hooks.append(last_block.register_forward_hook(self._feature_hook))
+                    # OpenCLIP style - 在最后一个block之前捕获特征
+                    # 使用倒数第二个block的输出，这样包含了位置信息但还没有最终的pooling
+                    target_block = visual.transformer.resblocks[-2] if len(visual.transformer.resblocks) > 1 else visual.transformer.resblocks[-1]
+                    hooks.append(target_block.register_forward_hook(self._feature_hook))
+                    if self.verbose:
+                        print(f"Registered hook on transformer block {len(visual.transformer.resblocks)-2}")
                 elif hasattr(visual.transformer, 'layers'):
                     # 另一种可能的命名
-                    last_block = visual.transformer.layers[-1]
-                    if hasattr(last_block, 'attn') or hasattr(last_block, 'self_attn'):
-                        attn_module = last_block.attn if hasattr(last_block, 'attn') else last_block.self_attn
-                        hooks.append(attn_module.register_forward_hook(self._attention_hook))
-                    hooks.append(last_block.register_forward_hook(self._feature_hook))
+                    target_block = visual.transformer.layers[-2] if len(visual.transformer.layers) > 1 else visual.transformer.layers[-1]
+                    hooks.append(target_block.register_forward_hook(self._feature_hook))
+                    if self.verbose:
+                        print(f"Registered hook on transformer layer {len(visual.transformer.layers)-2}")
         
         return hooks
     
@@ -261,33 +284,79 @@ class PrunedVisionEncoder:
         
         try:
             # 重置中间结果
-            self.attention_weights = None
             self.intermediate_features = None
+            self.pruning_applied = False
             
             # 执行原始的encode_image
-            features = self.original_encode_image(images)
+            original_features = self.original_encode_image(images)
             
-            # 如果成功捕获了注意力和特征，应用剪枝
-            if self.attention_weights is not None and self.intermediate_features is not None:
+            # 如果成功捕获了中间特征，应用剪枝
+            if self.intermediate_features is not None:
                 try:
                     # 确保维度正确
                     if len(self.intermediate_features.shape) == 3:
-                        # [batch, seq_len, dim]
+                        batch_size, seq_len, dim = self.intermediate_features.shape
+                        
+                        if self.verbose:
+                            print(f"Captured features shape: {self.intermediate_features.shape}")
+                            print(f"Original features shape: {original_features.shape}")
+                        
+                        # 手动计算注意力权重（基于特征相似度）
+                        # 这是一个简化版本，实际的attention计算更复杂
+                        num_heads = 12  # 大多数ViT使用12个头
+                        attention_weights = compute_attention_from_features(
+                            self.intermediate_features, 
+                            num_heads=num_heads
+                        )
+                        
+                        if self.verbose:
+                            print(f"Computed attention weights shape: {attention_weights.shape}")
+                        
+                        # 应用token剪枝
                         _, pruned_features = select_tokens_with_pruning(
-                            self.attention_weights,
+                            attention_weights,
                             self.intermediate_features,
                             k_anchors=self.k_anchors,
                             top_m=self.top_m,
                             alpha=self.alpha
                         )
+                        
+                        if self.verbose:
+                            print(f"Pruned features shape: {pruned_features.shape}")
+                        
                         # 对剪枝后的特征进行池化
                         # 只对非零特征求平均（因为有padding）
                         mask = (pruned_features.abs().sum(dim=-1) > 0).float().unsqueeze(-1)
-                        features = (pruned_features * mask).sum(dim=1) / (mask.sum(dim=1) + 1e-8)
+                        num_valid_tokens = mask.sum(dim=1)
+                        
+                        if self.verbose:
+                            print(f"Valid tokens per sample: {num_valid_tokens.squeeze().tolist()}")
+                        
+                        # 使用mean pooling
+                        pruned_pooled = (pruned_features * mask).sum(dim=1) / (num_valid_tokens + 1e-8)
+                        
+                        # 归一化
+                        pruned_pooled = F.normalize(pruned_pooled, dim=-1)
+                        
+                        self.pruning_applied = True
+                        
+                        if self.verbose:
+                            print(f"✓ Token pruning successfully applied!")
+                            print(f"  Original tokens: {seq_len}, Kept tokens: ~{int(num_valid_tokens.mean().item())}")
+                        
+                        return pruned_pooled
+                        
                 except Exception as e:
-                    print(f"Token pruning failed: {e}, using original features")
+                    if self.verbose:
+                        print(f"✗ Token pruning failed: {e}")
+                        import traceback
+                        traceback.print_exc()
+                    print(f"Warning: Token pruning failed: {e}, using original features")
+            else:
+                if self.verbose:
+                    print("✗ Failed to capture intermediate features, using original features")
             
-            return features
+            return original_features
             
         finally:
             # 清理hooks
@@ -295,7 +364,7 @@ class PrunedVisionEncoder:
                 hook.remove()
 
 
-def apply_pruning_to_model(model, k_anchors=10, top_m=50, alpha=0.5):
+def apply_pruning_to_model(model, k_anchors=10, top_m=50, alpha=0.5, verbose=False):
     """
     为模型应用token剪枝
     
@@ -304,11 +373,21 @@ def apply_pruning_to_model(model, k_anchors=10, top_m=50, alpha=0.5):
         k_anchors: 锚点数量
         top_m: 保留的非锚点token数量
         alpha: 重要性和多样性的权重平衡参数
+        verbose: 是否打印详细信息
     
     Returns:
         pruned_encoder: 包装后的编码器
     """
-    pruned_encoder = PrunedVisionEncoder(model, k_anchors, top_m, alpha)
+    if verbose:
+        print(f"\n{'='*60}")
+        print(f"Applying Token Pruning to Model")
+        print(f"{'='*60}")
+        print(f"  k_anchors: {k_anchors}")
+        print(f"  top_m: {top_m}")
+        print(f"  alpha: {alpha}")
+        print(f"{'='*60}\n")
+    
+    pruned_encoder = PrunedVisionEncoder(model, k_anchors, top_m, alpha, verbose=verbose)
     
     # 替换模型的encode_image方法
     model.encode_image = pruned_encoder.encode_image_with_pruning
