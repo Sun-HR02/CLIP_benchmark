@@ -8,13 +8,20 @@ echo "=========================================="
 echo "第一步：不启用 Token Selection 的评估"
 echo "=========================================="
 
+# 设置参数变量
+DATASET="mscoco_captions"
+MODEL="ViT-L-14"
+TASK="zeroshot_retrieval"
+PRETRAINED="openai"
+LANGUAGE="en"
+
 python -m clip_benchmark.cli eval \
-    --dataset cifar10 \
-    --model ViT-L-14 \
-    --task "zeroshot_retrieval" \
-    --pretrained openai \
+    --dataset $DATASET \
+    --model $MODEL \
+    --task "$TASK" \
+    --pretrained $PRETRAINED \
     --dataset_root "https://huggingface.co/datasets/clip-benchmark/wds_{dataset_cleaned}/tree/main" \
-    --output "${OUTPUT_DIR}/cifar10_openai_ViT-L-14_en_zeroshot_classification_baseline.json"
+    --output "${OUTPUT_DIR}/${DATASET}_${PRETRAINED}_${MODEL}_${LANGUAGE}_${TASK}_baseline.json"
 
 echo ""
 echo "=========================================="
@@ -22,16 +29,16 @@ echo "第二步：启用 Token Selection 的评估"
 echo "=========================================="
 
 python -m clip_benchmark.cli eval \
-    --dataset cifar10 \
-    --model ViT-L-14 \
-    --task "zeroshot_retrieval" \
-    --pretrained openai \
+    --dataset $DATASET \
+    --model $MODEL \
+    --task "$TASK" \
+    --pretrained $PRETRAINED \
     --dataset_root "https://huggingface.co/datasets/clip-benchmark/wds_{dataset_cleaned}/tree/main" \
     --enable_token_selection \
     --token_selection_k 15 \
     --token_selection_m 170 \
     --token_selection_alpha 1 \
-    --output "${OUTPUT_DIR}/cifar10_openai_ViT-L-14_en_zeroshot_classification_token_selection.json"
+    --output "${OUTPUT_DIR}/${DATASET}_${PRETRAINED}_${MODEL}_${LANGUAGE}_${TASK}_token_selection.json"
 
 echo ""
 echo "=========================================="
@@ -43,8 +50,8 @@ python - <<EOF
 import json
 import os
 
-baseline_file = "${OUTPUT_DIR}/cifar10_openai_ViT-L-14_en_zeroshot_classification_baseline.json"
-token_selection_file = "${OUTPUT_DIR}/cifar10_openai_ViT-L-14_en_zeroshot_classification_token_selection.json"
+baseline_file = "${OUTPUT_DIR}/${DATASET}_${PRETRAINED}_${MODEL}_${LANGUAGE}_${TASK}_baseline.json"
+token_selection_file = "${OUTPUT_DIR}/${DATASET}_${PRETRAINED}_${MODEL}_${LANGUAGE}_${TASK}_token_selection.json"
 
 print("\n对比结果：")
 print("=" * 80)
