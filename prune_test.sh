@@ -1,7 +1,7 @@
 python3 clip_benchmark/cli.py eval \
   --model_type "open_clip" \
-  --model "openai" \
-  --pretrained "ViT-B-32" \
+  --model "ViT-B-32" \
+  --pretrained "openai" \
   --language "en" \
   --task "zeroshot_classification"  \
   --dataset "cifar10"  \
