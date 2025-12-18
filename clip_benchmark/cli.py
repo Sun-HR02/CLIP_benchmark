@@ -65,11 +65,14 @@ def get_parser_args():
     parser_eval.add_argument('--load_clfs', nargs='+', default=[], type=str, help="optionally load and average mutliple layers output by text towers.")
     parser_eval.add_argument('--skip_existing', default=False, action="store_true", help="whether to skip an evaluation if the output file exists.")
     parser_eval.add_argument('--model_type', default="open_clip", type=str, choices=MODEL_TYPES, help="clip model type")
-    parser_eval.add_argument('--wds_cache_dir', default=None, type=str, help="optional cache directory for webdataset only")
-    parser_eval.add_argument('--extract_attention', default=False, action="store_true", help="whether to extract and save attention weights from vision encoder")
-    parser_eval.add_argument('--attention_output', default="attention_{dataset}_{pretrained}_{model}.pt", type=str, help="output file for attention weights")
+    parser_eval.add_argument('--wds_cache_dir', default=None, type=str, help=\"optional cache directory for webdataset only\")
+    parser_eval.add_argument('--extract_attention', default=False, action=\"store_true\", help=\"whether to extract and save attention weights from vision encoder\")
+    parser_eval.add_argument('--attention_output', default=\"attention_{dataset}_{pretrained}_{model}.pt\", type=str, help=\"output file for attention weights\")
+    parser_eval.add_argument('--enable_pruning', default=False, action=\"store_true\", help=\"whether to enable token pruning during evaluation\")
+    parser_eval.add_argument('--k_anchors', default=10, type=int, help=\"number of anchor tokens to select for pruning\")
+    parser_eval.add_argument('--top_m', default=50, type=int, help=\"number of top-m tokens to keep after pruning\")
+    parser_eval.add_argument('--alpha', default=0.5, type=float, help=\"weight balance between importance and diversity for pruning\")
     parser_eval.set_defaults(which='eval')
-
     parser_build = subparsers.add_parser('build', help='Build CSV from evaluations')
     parser_build.add_argument('files', type=str,  nargs="+", help="path(s) of JSON result files")
     parser_build.add_argument('--output', type=str,  default="benchmark.csv", help="CSV output file")
@@ -308,6 +311,29 @@ def run(args):
             print(f"Zero-shot templates: {zeroshot_templates}")
         classnames = dataset.classes if hasattr(dataset, "classes") else None
         assert (zeroshot_templates is not None and classnames is not None), "Dataset does not support classification"
+        
+        # 如果需要提取注意力或应用剪枝，在评估前注入剪枝逻辑
+        restore_fn = None
+        if args.extract_attention:
+            # 注入剪枝逻辑到模型（如果启用）
+            # 可以通过命令行参数控制剪枝参数
+            enable_pruning = getattr(args, 'enable_pruning', False)
+            k_anchors = getattr(args, 'k_anchors', 10)
+            top_m = getattr(args, 'top_m', 50)
+            alpha = getattr(args, 'alpha', 0.5)
+            
+            if args.verbose and enable_pruning:
+                print(f"Applying token pruning: k_anchors={k_anchors}, top_m={top_m}, alpha={alpha}")
+            
+            restore_fn = apply_pruning_to_model(
+                model, 
+                enable_pruning=enable_pruning,
+                k_anchors=k_anchors,
+                top_m=top_m,
+                alpha=alpha
+            )
+        
+        # 评估（此时如果启用了剪枝，模型会在前向传播时自动剪枝）
         metrics = zeroshot_classification.evaluate(
             model, 
             dataloader, 
@@ -319,6 +345,10 @@ def run(args):
             save_clf=args.save_clf,
             load_clfs=args.load_clfs,
         )
+        
+        # 恢复模型（如果之前注入了剪枝逻辑）
+        if restore_fn is not None:
+            restore_fn()
         
         # 提取注意力权重（如果需要）
         if args.extract_attention:
@@ -479,6 +509,172 @@ def world_info_from_env():
             world_size = int(os.environ[v])
             break
     return local_rank, global_rank, world_size
+
+def apply_pruning_to_model(model, enable_pruning=True, k_anchors=10, top_m=50, alpha=0.5):
+    """
+    为模型的视觉编码器注入剪枝逻辑，使其在前向传播时自动应用剪枝
+    
+    Args:
+        model: OpenCLIP 模型
+        enable_pruning: 是否启用token剪枝
+        k_anchors: 选择的锚点token数量
+        top_m: 最终保留的非锚点token数量
+        alpha: 重要性和多样性的权重平衡参数
+    
+    Returns:
+        restore_fn: 用于恢复原始模型的函数
+    """
+    visual = model.visual
+    original_forwards = []
+    
+    def select_tokens_by_pruning(x, attn_weights, k_anchors, top_m, alpha, device):
+        """
+        基于注意力的token剪枝策略
+        
+        Args:
+            x: token特征 [seq_len, batch_size, embed_dim]
+            attn_weights: 注意力权重 [batch_size, num_heads, seq_len, seq_len]
+            k_anchors: 锚点数量
+            top_m: 保留的非锚点token数量
+            alpha: 重要性和多样性的权重
+            device: 设备
+            
+        Returns:
+            selected_indices: 选中的token索引列表
+        """
+        seq_len, batch_size, embed_dim = x.shape
+        
+        # 转换x的维度: [seq_len, batch_size, embed_dim] -> [batch_size, seq_len, embed_dim]
+        x_batch = x.permute(1, 0, 2)
+        
+        # 1. 使用cls token的注意力选择k个锚点
+        cls_attention = attn_weights[:, :, 0, :].mean(dim=1)  # [batch_size, seq_len]
+        cls_attention_no_cls = cls_attention[:, 1:]  # [batch_size, seq_len-1]
+        _, anchor_indices_relative = torch.topk(cls_attention_no_cls, k=min(k_anchors, seq_len-1), dim=1)
+        anchor_indices = anchor_indices_relative + 1
+        
+        # 2. 计算重要性和多样性
+        avg_attn = attn_weights.mean(dim=1)  # [batch_size, seq_len, seq_len]
+        
+        importance_scores = []
+        diversity_scores = []
+        
+        for b in range(batch_size):
+            anchor_idx = anchor_indices[b]
+            
+            # 重要性: 每个token对锚点的平均注意力
+            attn_to_anchors = avg_attn[b, :, anchor_idx]
+            importance = attn_to_anchors.mean(dim=1)
+            
+            # 多样性: 1 - 与锚点的最大相似度
+            x_norm = torch.nn.functional.normalize(x_batch[b], p=2, dim=1)
+            anchor_features = x_norm[anchor_idx]
+            similarity = torch.matmul(x_norm, anchor_features.T)
+            max_similarity = similarity.max(dim=1)[0]
+            diversity = 1 - max_similarity
+            
+            importance_scores.append(importance)
+            diversity_scores.append(diversity)
+        
+        importance_scores = torch.stack(importance_scores)
+        diversity_scores = torch.stack(diversity_scores)
+        
+        # 3. 计算最终评分并选择top-m个token
+        final_scores = alpha * importance_scores + (1 - alpha) * diversity_scores
+        
+        selected_indices_list = []
+        for b in range(batch_size):
+            mask = torch.ones(seq_len, dtype=torch.bool, device=final_scores.device)
+            mask[0] = False
+            mask[anchor_indices[b]] = False
+            
+            remaining_scores = final_scores[b].clone()
+            remaining_scores[~mask] = -float('inf')
+            
+            _, top_m_indices = torch.topk(remaining_scores, k=min(top_m, mask.sum().item()), dim=0)
+            
+            # 合并: cls + 锚点 + top-m
+            selected = torch.cat([
+                torch.tensor([0], device=device),
+                anchor_indices[b],
+                top_m_indices
+            ])
+            
+            selected = torch.sort(selected)[0]
+            selected_indices_list.append(selected)
+        
+        return selected_indices_list
+    
+    # 为每个transformer block注入剪枝逻辑
+    for i, block in enumerate(visual.transformer.resblocks):
+        original_forward = block.attn.forward
+        original_forwards.append(original_forward)
+        
+        def make_custom_forward(orig_forward, layer_idx, block_ref):
+            def custom_forward(*args, **kwargs):
+                x = args[0] if len(args) > 0 else kwargs.get('x')
+                attn_mask = args[1] if len(args) > 1 else kwargs.get('attn_mask', None)
+                
+                seq_len, batch_size, embed_dim = x.shape
+                
+                # 计算注意力权重
+                qkv = torch.nn.functional.linear(x, block_ref.attn.in_proj_weight, block_ref.attn.in_proj_bias)
+                qkv = qkv.reshape(seq_len, batch_size, 3, block_ref.attn.num_heads, embed_dim // block_ref.attn.num_heads)
+                qkv = qkv.permute(2, 1, 3, 0, 4)
+                q, k, v = qkv[0], qkv[1], qkv[2]
+                
+                scale = (embed_dim // block_ref.attn.num_heads) ** -0.5
+                attn = torch.matmul(q, k.transpose(-2, -1)) * scale
+                
+                if attn_mask is not None:
+                    attn = attn + attn_mask
+                
+                attn_weights = torch.nn.functional.softmax(attn, dim=-1)
+                
+                # 如果启用剪枝且不是第一层
+                if enable_pruning and layer_idx > 0:
+                    with torch.no_grad():
+                        selected_indices_list = select_tokens_by_pruning(
+                            x, attn_weights.detach(), k_anchors, top_m, alpha, x.device
+                        )
+                        
+                        # 使用第一个batch的选择应用到所有batch
+                        selected_idx = selected_indices_list[0]
+                        x_pruned = x[selected_idx, :, :]
+                        
+                        # 剪枝attn_mask
+                        attn_mask_pruned = None
+                        if attn_mask is not None:
+                            if attn_mask.dim() == 2:
+                                attn_mask_pruned = attn_mask[selected_idx][:, selected_idx]
+                            elif attn_mask.dim() == 4:
+                                attn_mask_pruned = attn_mask[:, :, selected_idx][:, :, :, selected_idx]
+                            else:
+                                attn_mask_pruned = attn_mask[..., selected_idx, :][..., selected_idx]
+                        
+                        # 使用剪枝后的x
+                        if len(args) > 1:
+                            new_args = (x_pruned, attn_mask_pruned) + args[2:]
+                        else:
+                            new_args = (x_pruned,)
+                            if attn_mask_pruned is not None:
+                                kwargs['attn_mask'] = attn_mask_pruned
+                        
+                        return orig_forward(*new_args, **kwargs)
+                
+                # 不剪枝，调用原始forward
+                return orig_forward(*args, **kwargs)
+            return custom_forward
+        
+        block.attn.forward = make_custom_forward(original_forward, i, block)
+    
+    # 返回恢复函数
+    def restore_model():
+        for i, block in enumerate(visual.transformer.resblocks):
+            block.attn.forward = original_forwards[i]
+    
+    return restore_model
+
 
 def get_vision_attention(model, images, device='cuda', enable_pruning=True, k_anchors=10, top_m=50, alpha=0.5):
     """
@@ -675,9 +871,29 @@ def get_vision_attention(model, images, device='cuda', enable_pruning=True, k_an
                         selected_idx = selected_indices_list[0]
                         x_pruned = x[selected_idx, :, :]
                         
+                        # 如果存在attn_mask，也需要对其进行剪枝
+                        attn_mask_pruned = None
+                        if attn_mask is not None:
+                            # attn_mask 通常是 [seq_len, seq_len] 或 [1, 1, seq_len, seq_len]
+                            if attn_mask.dim() == 2:
+                                # [seq_len, seq_len] -> 选择对应的行和列
+                                attn_mask_pruned = attn_mask[selected_idx][:, selected_idx]
+                            elif attn_mask.dim() == 4:
+                                # [1, 1, seq_len, seq_len] -> 选择对应的行和列
+                                attn_mask_pruned = attn_mask[:, :, selected_idx][:, :, :, selected_idx]
+                            else:
+                                # 其他情况，尝试在最后两个维度上进行索引
+                                attn_mask_pruned = attn_mask[..., selected_idx, :][..., selected_idx]
+                        
                         # 使用剪枝后的x继续前向传播
                         # 重新构造参数
-                        new_args = (x_pruned,) + args[1:] if len(args) > 1 else (x_pruned,)
+                        if len(args) > 1:
+                            new_args = (x_pruned, attn_mask_pruned) + args[2:]
+                        else:
+                            new_args = (x_pruned,)
+                            if attn_mask_pruned is not None:
+                                kwargs['attn_mask'] = attn_mask_pruned
+                        
                         return orig_forward(*new_args, **kwargs)
                 
                 # 调用原始 forward
