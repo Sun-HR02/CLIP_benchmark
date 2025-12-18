@@ -10,6 +10,7 @@ import torch.nn.functional as F
 from tqdm import tqdm
 
 from sklearn.metrics import classification_report, balanced_accuracy_score
+from .token_selection import apply_token_selection
 
 
 
@@ -82,7 +83,9 @@ def accuracy(output, target, topk=(1,)):
     return [float(correct[:k].reshape(-1).float().sum(0, keepdim=True).cpu().numpy()) / n for k in topk]
 
 
-def run_classification(model, classifier, dataloader, device, amp=True):
+def run_classification(model, classifier, dataloader, device, amp=True, 
+                      enable_token_selection=False, token_selection_k=10, 
+                      token_selection_m=50, token_selection_alpha=0.5):
     """
     Run zero-shot classifcation
 
@@ -93,6 +96,18 @@ def run_classification(model, classifier, dataloader, device, amp=True):
         obtained from the function `zero_shot_classifier`
     
     dataloader: torch.utils.data.Dataloader 
+    
+    enable_token_selection: bool
+        whether to apply token selection before computing metrics
+    
+    token_selection_k: int
+        number of anchor tokens to select
+    
+    token_selection_m: int
+        number of additional tokens to select
+    
+    token_selection_alpha: float
+        weight for importance vs diversity
     
     Returns
     -------
@@ -111,6 +126,17 @@ def run_classification(model, classifier, dataloader, device, amp=True):
             with torch.autocast(device, enabled=amp):
                 # predict
                 image_features = model.encode_image(images)
+                
+                # Apply token selection if enabled
+                if enable_token_selection:
+                    image_features = apply_token_selection(
+                        image_features, 
+                        k=token_selection_k, 
+                        m=token_selection_m, 
+                        alpha=token_selection_alpha,
+                        enabled=True
+                    )
+                
                 image_features = F.normalize(image_features, dim=-1)
                 logits = 100. * image_features @ classifier
             
@@ -162,7 +188,9 @@ def average_precision_per_class(scores, targets):
     return ap
 
 
-def evaluate(model, dataloader, tokenizer, classnames, templates, device, amp=True, verbose=False, save_clf=None, load_clfs=[]):
+def evaluate(model, dataloader, tokenizer, classnames, templates, device, amp=True, verbose=False, 
+            save_clf=None, load_clfs=[], enable_token_selection=False, token_selection_k=10,
+            token_selection_m=50, token_selection_alpha=0.5):
     """
     Run zero-shot classification and evaluate the metrics
 
@@ -187,6 +215,18 @@ def evaluate(model, dataloader, tokenizer, classnames, templates, device, amp=Tr
     amp: whether to use automatic mixed precision
 
     verbose: whether to use verbose model
+    
+    enable_token_selection: bool
+        whether to apply token selection before computing metrics
+    
+    token_selection_k: int
+        number of anchor tokens to select
+    
+    token_selection_m: int
+        number of additional tokens to select
+    
+    token_selection_alpha: float
+        weight for importance vs diversity
 
     Returns
     -------
@@ -206,7 +246,11 @@ def evaluate(model, dataloader, tokenizer, classnames, templates, device, amp=Tr
         torch.save(classifier, save_clf)
         # exit() - not sure if we want to exit here or not.
 
-    logits, target = run_classification(model, classifier, dataloader, device, amp=amp)
+    logits, target = run_classification(model, classifier, dataloader, device, amp=amp,
+                                       enable_token_selection=enable_token_selection,
+                                       token_selection_k=token_selection_k,
+                                       token_selection_m=token_selection_m,
+                                       token_selection_alpha=token_selection_alpha)
     is_multilabel = (len(target.shape) == 2)
 
     if is_multilabel:

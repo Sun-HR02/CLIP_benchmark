@@ -66,6 +66,10 @@ def get_parser_args():
     parser_eval.add_argument('--skip_existing', default=False, action="store_true", help="whether to skip an evaluation if the output file exists.")
     parser_eval.add_argument('--model_type', default="open_clip", type=str, choices=MODEL_TYPES, help="clip model type")
     parser_eval.add_argument('--wds_cache_dir', default=None, type=str, help="optional cache directory for webdataset only")
+    parser_eval.add_argument('--enable_token_selection', default=False, action="store_true", help="enable token selection before computing metrics")
+    parser_eval.add_argument('--token_selection_k', default=10, type=int, help="number of anchor tokens to select based on CLS attention")
+    parser_eval.add_argument('--token_selection_m', default=50, type=int, help="number of additional tokens to select based on importance and diversity")
+    parser_eval.add_argument('--token_selection_alpha', default=0.5, type=float, help="weight for importance vs diversity (0 to 1)")
     parser_eval.set_defaults(which='eval')
 
     parser_build = subparsers.add_parser('build', help='Build CSV from evaluations')
@@ -316,7 +320,11 @@ def run(args):
             verbose=args.verbose,
             save_clf=args.save_clf,
             load_clfs=args.load_clfs,
-        ) 
+            enable_token_selection=args.enable_token_selection,
+            token_selection_k=args.token_selection_k,
+            token_selection_m=args.token_selection_m,
+            token_selection_alpha=args.token_selection_alpha,
+        )
     elif task == "zeroshot_retrieval":
         metrics = zeroshot_retrieval.evaluate(
             model, 
