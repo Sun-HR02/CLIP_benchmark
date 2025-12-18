@@ -10,10 +10,10 @@ echo "=========================================="
 
 python -m clip_benchmark.cli eval \
     --dataset cifar10 \
-    --model ViT-B-32 \
+    --model ViT-L-14 \
     --pretrained openai \
     --dataset_root "https://huggingface.co/datasets/clip-benchmark/wds_{dataset_cleaned}/tree/main" \
-    --output "${OUTPUT_DIR}/cifar10_openai_ViT-B-32_en_zeroshot_classification_baseline.json"
+    --output "${OUTPUT_DIR}/cifar10_openai_ViT-L-14_en_zeroshot_classification_baseline.json"
 
 echo ""
 echo "=========================================="
@@ -22,14 +22,14 @@ echo "=========================================="
 
 python -m clip_benchmark.cli eval \
     --dataset cifar10 \
-    --model ViT-B-32 \
+    --model ViT-L-14 \
     --pretrained openai \
     --dataset_root "https://huggingface.co/datasets/clip-benchmark/wds_{dataset_cleaned}/tree/main" \
     --enable_token_selection \
     --token_selection_k 15 \
     --token_selection_m 400 \
     --token_selection_alpha 0.6 \
-    --output "${OUTPUT_DIR}/cifar10_openai_ViT-B-32_en_zeroshot_classification_token_selection.json"
+    --output "${OUTPUT_DIR}/cifar10_openai_ViT-L-14_en_zeroshot_classification_token_selection.json"
 
 echo ""
 echo "=========================================="
