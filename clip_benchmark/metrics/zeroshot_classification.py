@@ -83,6 +83,50 @@ def accuracy(output, target, topk=(1,)):
     return [float(correct[:k].reshape(-1).float().sum(0, keepdim=True).cpu().numpy()) / n for k in topk]
 
 
+def get_image_features_with_tokens(model, images):
+    """
+    Get image features with all tokens (unpooled) from CLIP model.
+    
+    Args:
+        model: CLIP model
+        images: input images tensor
+    
+    Returns:
+        image_features: torch.Tensor of shape (B, N, D) for ViT models or (B, D) for others
+    """
+    # Try to get unpooled features from vision transformer
+    if hasattr(model, 'visual'):
+        visual = model.visual
+        
+        # For open_clip ViT models, we can directly call the visual encoder
+        # and extract features before the final pooling
+        try:
+            # Encode patches
+            x = visual.conv1(images)  # shape = [*, width, grid, grid]
+            x = x.reshape(x.shape[0], x.shape[1], -1)  # shape = [*, width, grid ** 2]
+            x = x.permute(0, 2, 1)  # shape = [*, grid ** 2, width]
+            
+            # Add class token
+            x = torch.cat([visual.class_embedding.to(x.dtype) + torch.zeros(x.shape[0], 1, x.shape[-1], dtype=x.dtype, device=x.device), x], dim=1)  # shape = [*, grid ** 2 + 1, width]
+            x = x + visual.positional_embedding.to(x.dtype)
+            
+            # Apply transformer
+            x = visual.ln_pre(x)
+            x = x.permute(1, 0, 2)  # NLD -> LND
+            x = visual.transformer(x)
+            x = x.permute(1, 0, 2)  # LND -> NLD
+            
+            # Return all tokens WITHOUT final layer norm and pooling
+            # This gives us (B, N, D) where N = grid**2 + 1 (including CLS token)
+            return x
+        except Exception as e:
+            # If anything fails, fall back to standard encode_image
+            pass
+    
+    # Fallback: use standard encode_image (returns pooled features)
+    return model.encode_image(images)
+
+
 def run_classification(model, classifier, dataloader, device, amp=True, 
                       enable_token_selection=False, token_selection_k=10, 
                       token_selection_m=50, token_selection_alpha=0.5):
@@ -124,11 +168,31 @@ def run_classification(model, classifier, dataloader, device, amp=True,
             target = target.to(device)
 
             with torch.autocast(device, enabled=amp):
-                # predict
-                image_features = model.encode_image(images)
-                
-                # Apply token selection if enabled
+                # Get image features (with tokens if possible)
                 if enable_token_selection:
+                    # Get unpooled token features for token selection
+                    image_features = get_image_features_with_tokens(model, images)
+                    
+                    print(f"[Debug] Unpooled image features shape: {image_features.shape}")
+                    
+                    # Apply layer norm to all tokens BEFORE token selection
+                    # This is important because token selection should work on normalized features
+                    if len(image_features.shape) == 3:
+                        if hasattr(model, 'visual') and hasattr(model.visual, 'ln_post'):
+                            image_features = model.visual.ln_post(image_features)
+                            print(f"[Debug] After ln_post, shape: {image_features.shape}")
+                        
+                        # Apply projection to each token if exists
+                        # This transforms from transformer dim (768) to embedding dim (512)
+                        if hasattr(model, 'visual') and hasattr(model.visual, 'proj') and model.visual.proj is not None:
+                            B, N, D = image_features.shape
+                            # Reshape to (B*N, D), apply projection, reshape back
+                            image_features_flat = image_features.reshape(B * N, D)
+                            image_features_flat = image_features_flat @ model.visual.proj
+                            image_features = image_features_flat.reshape(B, N, -1)
+                            print(f"[Debug] After projection to each token, shape: {image_features.shape}")
+                    
+                    # Apply token selection on the projected features
                     image_features = apply_token_selection(
                         image_features, 
                         k=token_selection_k, 
@@ -136,6 +200,17 @@ def run_classification(model, classifier, dataloader, device, amp=True,
                         alpha=token_selection_alpha,
                         enabled=True
                     )
+                    
+                    # Pool the selected tokens: mean pooling over non-zero tokens
+                    if len(image_features.shape) == 3:
+                        # Create mask for non-zero tokens
+                        token_mask = (image_features.abs().sum(dim=-1) > 0).float()  # (B, N)
+                        # Sum features and divide by number of non-zero tokens
+                        image_features = (image_features * token_mask.unsqueeze(-1)).sum(dim=1) / token_mask.sum(dim=1, keepdim=True).clamp(min=1)
+                        print(f"[Debug] After pooling selected tokens, shape: {image_features.shape}")
+                else:
+                    # Standard path: use pooled features
+                    image_features = model.encode_image(images)
                 
                 image_features = F.normalize(image_features, dim=-1)
                 logits = 100. * image_features @ classifier
