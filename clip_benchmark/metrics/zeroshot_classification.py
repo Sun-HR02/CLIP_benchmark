@@ -13,6 +13,54 @@ from sklearn.metrics import classification_report, balanced_accuracy_score
 from .token_selection import apply_token_selection
 
 
+def get_image_features_with_tokens(model, images):
+    """
+    Get image features with all tokens (unpooled) for token selection.
+    
+    Args:
+        model: CLIP model
+        images: input images tensor
+    
+    Returns:
+        features: (B, N, D) tensor with all tokens, or (B, D) if unpooled features unavailable
+    """
+    # Try to get unpooled features from OpenCLIP models
+    if hasattr(model, 'visual'):
+        visual = model.visual
+        
+        # Check if it's a Vision Transformer
+        if hasattr(visual, 'conv1') and hasattr(visual, 'transformer'):
+            # Standard OpenCLIP ViT
+            x = visual.conv1(images)  # shape = [*, width, grid, grid]
+            x = x.reshape(x.shape[0], x.shape[1], -1)  # shape = [*, width, grid ** 2]
+            x = x.permute(0, 2, 1)  # shape = [*, grid ** 2, width]
+            
+            # Add class token
+            x = torch.cat([
+                visual.class_embedding.to(x.dtype) + torch.zeros(
+                    x.shape[0], 1, x.shape[-1], dtype=x.dtype, device=x.device
+                ), x
+            ], dim=1)  # shape = [*, grid ** 2 + 1, width]
+            
+            x = x + visual.positional_embedding.to(x.dtype)
+            x = visual.ln_pre(x)
+            
+            x = x.permute(1, 0, 2)  # NLD -> LND
+            x = visual.transformer(x)
+            x = x.permute(1, 0, 2)  # LND -> NLD
+            
+            # Return all tokens before pooling
+            return x  # (B, N, D)
+        
+        elif hasattr(visual, 'trunk'):
+            # For models with trunk attribute (e.g., timm models)
+            x = visual.trunk.forward_features(images)
+            return x
+    
+    # Fallback: return standard pooled features
+    return model.encode_image(images)
+
+
 
 def zero_shot_classifier(model, tokenizer, classnames, templates, device, amp=True):
     """
@@ -125,21 +173,38 @@ def run_classification(model, classifier, dataloader, device, amp=True,
 
             with torch.autocast(device, enabled=amp):
                 # predict
-                image_features = model.encode_image(images)
-                
-                # Apply token selection if enabled
                 if enable_token_selection:
+                    # Get unpooled features (all tokens) for token selection
+                    image_features = get_image_features_with_tokens(model, images)
+                    
+                    # Debug: print shape on first batch
+                    if nb == 0:
+                        print(f"[Debug] Unpooled image features shape: {image_features.shape}")
+                    
+                    # Apply token selection
                     image_features = apply_token_selection(
                         image_features, 
                         k=token_selection_k, 
                         m=token_selection_m, 
                         alpha=token_selection_alpha,
-                        enabled=True
+                        enabled=True,
+                        verbose=(nb == 0)  # Only verbose on first batch
                     )
+                    
+                    # Pool the selected tokens
+                    if len(image_features.shape) == 3:
+                        # Use CLS token (first token) after selection
+                        image_features = image_features[:, 0, :]  # (B, D)
+                        if nb == 0:
+                            print(f"[Debug] After pooling CLS token, shape: {image_features.shape}")
+                else:
+                    # Standard path without token selection
+                    image_features = model.encode_image(images)
                 
                 image_features = F.normalize(image_features, dim=-1)
                 logits = 100. * image_features @ classifier
             
+            nb += 1
             true.append(target.cpu())
             pred.append(logits.float().cpu())
 

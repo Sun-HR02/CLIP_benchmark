@@ -162,7 +162,7 @@ def select_tokens_with_scoring(image_features, anchor_indices, importance_scores
     return selected_features
 
 
-def apply_token_selection(image_features, k=10, m=50, alpha=0.5, enabled=True):
+def apply_token_selection(image_features, k=10, m=50, alpha=0.5, enabled=True, verbose=False):
     """
     Apply token selection to image features.
     
@@ -173,22 +173,30 @@ def apply_token_selection(image_features, k=10, m=50, alpha=0.5, enabled=True):
         m: number of additional tokens to select based on importance/diversity
         alpha: weight for importance vs diversity (0 to 1)
         enabled: whether to apply token selection (if False, returns original features)
+        verbose: whether to print debug information
     
     Returns:
         selected_features: torch.Tensor of same shape as input
             If token selection is applied, returns (B, N, D) with selected tokens and zeros elsewhere
     """
     if not enabled:
+        if verbose:
+            print("[Token Selection] Disabled, returning original features")
         return image_features
     
     # Check if features are already pooled (2D)
     if len(image_features.shape) == 2:
         # Already pooled, return as-is
+        if verbose:
+            print(f"[Token Selection] Features already pooled (shape: {image_features.shape}), returning as-is")
         return image_features
     
     # Features should be (B, N, D)
     if len(image_features.shape) != 3:
         raise ValueError(f"Expected image_features to be 3D (B, N, D) or 2D (B, D), got shape {image_features.shape}")
+    
+    if verbose:
+        print(f"[Token Selection] Applying token selection on features with shape: {image_features.shape}")
     
     B, N, D = image_features.shape
     
@@ -213,5 +221,11 @@ def apply_token_selection(image_features, k=10, m=50, alpha=0.5, enabled=True):
     selected_features = select_tokens_with_scoring(
         image_features, anchor_indices, importance_scores, diversity_scores, m=m, alpha=alpha
     )
+    
+    if verbose:
+        # Count non-zero tokens
+        non_zero_mask = (selected_features.abs().sum(dim=-1) > 0)
+        num_selected = non_zero_mask.sum(dim=1).float().mean().item()
+        print(f"[Token Selection] Selected {num_selected:.1f} tokens on average (k={k}, m={m}, alpha={alpha})")
     
     return selected_features
