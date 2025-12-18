@@ -164,6 +164,8 @@ def run_classification(model, classifier, dataloader, device, amp=True,
     nb = 0
     with torch.no_grad():
         for images, target in tqdm(dataloader):
+            import ipdb;ipdb.set_trace()
+
             images = images.to(device)
             target = target.to(device)
 
