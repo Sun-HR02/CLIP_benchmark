@@ -615,27 +615,26 @@ def apply_pruning_to_model(model, enable_pruning=True, k_anchors=10, top_m=50, a
                 x = args[0] if len(args) > 0 else kwargs.get('x')
                 attn_mask = args[1] if len(args) > 1 else kwargs.get('attn_mask', None)
                 
-                seq_len, batch_size, embed_dim = x.shape
-                
-                # 计算注意力权重
-                qkv = torch.nn.functional.linear(x, block_ref.attn.in_proj_weight, block_ref.attn.in_proj_bias)
-                qkv = qkv.reshape(seq_len, batch_size, 3, block_ref.attn.num_heads, embed_dim // block_ref.attn.num_heads)
-                qkv = qkv.permute(2, 1, 3, 0, 4)
-                q, k, v = qkv[0], qkv[1], qkv[2]
-                
-                scale = (embed_dim // block_ref.attn.num_heads) ** -0.5
-                attn = torch.matmul(q, k.transpose(-2, -1)) * scale
-                
-                if attn_mask is not None:
-                    attn = attn + attn_mask
-                
-                attn_weights = torch.nn.functional.softmax(attn, dim=-1)
-                
-                # 如果启用剪枝且不是第一层
+                # 如果启用剪枝且不是第一层，先进行token选择
                 if enable_pruning and layer_idx > 0:
+                    seq_len, batch_size, embed_dim = x.shape
+                    
+                    # 计算注意力权重用于token选择
                     with torch.no_grad():
+                        qkv = torch.nn.functional.linear(x, block_ref.attn.in_proj_weight, block_ref.attn.in_proj_bias)
+                        qkv = qkv.reshape(seq_len, batch_size, 3, block_ref.attn.num_heads, embed_dim // block_ref.attn.num_heads)
+                        qkv = qkv.permute(2, 1, 3, 0, 4)
+                        q, k, v = qkv[0], qkv[1], qkv[2]
+                        
+                        scale = (embed_dim // block_ref.attn.num_heads) ** -0.5
+                        attn = torch.matmul(q, k.transpose(-2, -1)) * scale
+                        
+                        # 注意：这里不应用attn_mask，因为我们需要基于原始注意力选择token
+                        attn_weights = torch.nn.functional.softmax(attn, dim=-1)
+                        
+                        # 选择要保留的token
                         selected_indices_list = select_tokens_by_pruning(
-                            x, attn_weights.detach(), k_anchors, top_m, alpha, x.device
+                            x, attn_weights, k_anchors, top_m, alpha, x.device
                         )
                         
                         # 使用第一个batch的选择应用到所有batch
@@ -646,23 +645,26 @@ def apply_pruning_to_model(model, enable_pruning=True, k_anchors=10, top_m=50, a
                         attn_mask_pruned = None
                         if attn_mask is not None:
                             if attn_mask.dim() == 2:
+                                # [seq_len, seq_len]
                                 attn_mask_pruned = attn_mask[selected_idx][:, selected_idx]
                             elif attn_mask.dim() == 4:
+                                # [1, 1, seq_len, seq_len] or [batch, heads, seq_len, seq_len]
                                 attn_mask_pruned = attn_mask[:, :, selected_idx][:, :, :, selected_idx]
                             else:
+                                # 其他情况
                                 attn_mask_pruned = attn_mask[..., selected_idx, :][..., selected_idx]
                         
-                        # 使用剪枝后的x
+                        # 使用剪枝后的x和attn_mask调用原始forward
                         if len(args) > 1:
                             new_args = (x_pruned, attn_mask_pruned) + args[2:]
+                            return orig_forward(*new_args, **{k: v for k, v in kwargs.items() if k != 'attn_mask'})
                         else:
-                            new_args = (x_pruned,)
+                            new_kwargs = kwargs.copy()
                             if attn_mask_pruned is not None:
-                                kwargs['attn_mask'] = attn_mask_pruned
-                        
-                        return orig_forward(*new_args, **kwargs)
+                                new_kwargs['attn_mask'] = attn_mask_pruned
+                            return orig_forward(x_pruned, **new_kwargs)
                 
-                # 不剪枝，调用原始forward
+                # 不剪枝，直接调用原始forward
                 return orig_forward(*args, **kwargs)
             return custom_forward
         
