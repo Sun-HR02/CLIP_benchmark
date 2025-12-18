@@ -202,10 +202,6 @@ def run_classification(model, classifier, dataloader, device, amp=True,
                     # print(f"[Debug] Unpooled image features shape: {image_features.shape}")
                     # import ipdb;ipdb.set_trace()
                     
-                    # Count zeros before token selection
-                    zeros_before = (image_features == 0).sum().item()
-                    total_elements_before = image_features.numel()
-                    sparsity_before = zeros_before / total_elements_before * 100
                     
                     # Apply token selection to get sparse representation
                     image_features = apply_token_selection(
@@ -216,17 +212,7 @@ def run_classification(model, classifier, dataloader, device, amp=True,
                         enabled=True
                     )
                     
-                    # Count zeros after token selection
-                    zeros_after = (image_features == 0).sum().item()
-                    total_elements_after = image_features.numel()
-                    sparsity_after = zeros_after / total_elements_after * 100
-                    
-                    # Print statistics for comparison
-                    print(f"[Token Selection Statistics]")
-                    print(f"  Before: {zeros_before}/{total_elements_before} zeros ({sparsity_before:.2f}% sparsity)")
-                    print(f"  After:  {zeros_after}/{total_elements_after} zeros ({sparsity_after:.2f}% sparsity)")
-                    print(f"  Increase: {zeros_after - zeros_before} zeros (+{sparsity_after - sparsity_before:.2f}%)")
-                    
+                   
                     # print(f"[Token Selection] After selection (sparse), shape: {image_features.shape}")
                     
                     # Pool the selected tokens: mean pooling over non-zero tokens
@@ -237,7 +223,7 @@ def run_classification(model, classifier, dataloader, device, amp=True,
                         # print(f"[Token Selection] Average number of selected tokens: {num_selected:.1f}")
                         # Sum features and divide by number of non-zero tokens
                         image_features = (image_features * token_mask.unsqueeze(-1)).sum(dim=1) / token_mask.sum(dim=1, keepdim=True).clamp(min=1)
-                        print(f"[Debug] After pooling selected tokens, shape: {image_features.shape}")
+                        # print(f"[Debug] After pooling selected tokens, shape: {image_features.shape}")
                 else:
                     # Standard path: use pooled features
                     image_features = model.encode_image(images)
