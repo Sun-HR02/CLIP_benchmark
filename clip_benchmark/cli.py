@@ -631,7 +631,11 @@ def get_vision_attention(model, images, device='cuda', enable_pruning=True, k_an
         original_forwards.append(original_forward)
         
         def make_custom_forward(orig_forward, layer_idx):
-            def custom_forward(x, attn_mask=None, **kwargs):
+            def custom_forward(*args, **kwargs):
+                # 提取参数
+                x = args[0] if len(args) > 0 else kwargs.get('x')
+                attn_mask = args[1] if len(args) > 1 else kwargs.get('attn_mask', None)
+                
                 # 手动计算注意力权重
                 # x shape: [seq_len, batch_size, embed_dim]
                 seq_len, batch_size, embed_dim = x.shape
@@ -672,10 +676,12 @@ def get_vision_attention(model, images, device='cuda', enable_pruning=True, k_an
                         x_pruned = x[selected_idx, :, :]
                         
                         # 使用剪枝后的x继续前向传播
-                        return orig_forward(x_pruned, attn_mask, **kwargs)
+                        # 重新构造参数
+                        new_args = (x_pruned,) + args[1:] if len(args) > 1 else (x_pruned,)
+                        return orig_forward(*new_args, **kwargs)
                 
                 # 调用原始 forward
-                return orig_forward(x, attn_mask, **kwargs)
+                return orig_forward(*args, **kwargs)
             return custom_forward
         
         # 替换 forward 方法
