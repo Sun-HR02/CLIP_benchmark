@@ -4,7 +4,7 @@ python3 clip_benchmark/cli.py eval \
   --pretrained "openai" \
   --language "en" \
   --task "zeroshot_classification"  \
-  --dataset "cifr10"  \
+  --dataset "cifar10"  \
   --dataset_root "https://huggingface.co/datasets/clip-benchmark/wds_{dataset_cleaned}/tree/main" \
   --extract_attention \
   --attention_output "my_attention_weights.pt"
