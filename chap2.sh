@@ -20,7 +20,6 @@ python -m clip_benchmark.cli eval \
     --model $MODEL \
     --task "$TASK" \
     --pretrained $PRETRAINED \
-    --dataset_root "https://huggingface.co/datasets/clip-benchmark/wds_{dataset_cleaned}/tree/main" \
     --output "${OUTPUT_DIR}/${DATASET}_${PRETRAINED}_${MODEL}_${LANGUAGE}_${TASK}_baseline.json"
 
 echo ""
@@ -33,7 +32,6 @@ python -m clip_benchmark.cli eval \
     --model $MODEL \
     --task "$TASK" \
     --pretrained $PRETRAINED \
-    --dataset_root "https://huggingface.co/datasets/clip-benchmark/wds_{dataset_cleaned}/tree/main" \
     --enable_token_selection \
     --token_selection_k 15 \
     --token_selection_m 170 \
