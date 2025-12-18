@@ -527,22 +527,33 @@ def apply_pruning_to_model(model, enable_pruning=True, k_anchors=10, top_m=50, a
     visual = model.visual
     original_forwards = []
     
-    def select_tokens_by_pruning(x, attn_weights, k_anchors, top_m, alpha, device):
+    def select_tokens_by_pruning(x, block_attn, k_anchors, top_m, alpha, device):
         """
         基于注意力的token剪枝策略
         
         Args:
             x: token特征 [seq_len, batch_size, embed_dim]
-            attn_weights: 注意力权重 [batch_size, num_heads, seq_len, seq_len]
+            block_attn: attention模块，用于计算注意力权重
             k_anchors: 锚点数量
             top_m: 保留的非锚点token数量
             alpha: 重要性和多样性的权重
             device: 设备
             
         Returns:
-            selected_indices: 选中的token索引列表
+            selected_indices: 选中的token索引（使用第一个batch）
         """
         seq_len, batch_size, embed_dim = x.shape
+        
+        # 计算注意力权重
+        with torch.no_grad():
+            qkv = torch.nn.functional.linear(x, block_attn.in_proj_weight, block_attn.in_proj_bias)
+            qkv = qkv.reshape(seq_len, batch_size, 3, block_attn.num_heads, embed_dim // block_attn.num_heads)
+            qkv = qkv.permute(2, 1, 3, 0, 4)
+            q, k, v = qkv[0], qkv[1], qkv[2]
+            
+            scale = (embed_dim // block_attn.num_heads) ** -0.5
+            attn = torch.matmul(q, k.transpose(-2, -1)) * scale
+            attn_weights = torch.nn.functional.softmax(attn, dim=-1)
         
         # 转换x的维度: [seq_len, batch_size, embed_dim] -> [batch_size, seq_len, embed_dim]
         x_batch = x.permute(1, 0, 2)
@@ -582,98 +593,62 @@ def apply_pruning_to_model(model, enable_pruning=True, k_anchors=10, top_m=50, a
         # 3. 计算最终评分并选择top-m个token
         final_scores = alpha * importance_scores + (1 - alpha) * diversity_scores
         
-        selected_indices_list = []
-        for b in range(batch_size):
-            mask = torch.ones(seq_len, dtype=torch.bool, device=final_scores.device)
-            mask[0] = False
-            mask[anchor_indices[b]] = False
-            
-            remaining_scores = final_scores[b].clone()
-            remaining_scores[~mask] = -float('inf')
-            
-            _, top_m_indices = torch.topk(remaining_scores, k=min(top_m, mask.sum().item()), dim=0)
-            
-            # 合并: cls + 锚点 + top-m
-            selected = torch.cat([
-                torch.tensor([0], device=device),
-                anchor_indices[b],
-                top_m_indices
-            ])
-            
-            selected = torch.sort(selected)[0]
-            selected_indices_list.append(selected)
+        # 使用第一个batch的选择
+        b = 0
+        mask = torch.ones(seq_len, dtype=torch.bool, device=final_scores.device)
+        mask[0] = False
+        mask[anchor_indices[b]] = False
         
-        return selected_indices_list
+        remaining_scores = final_scores[b].clone()
+        remaining_scores[~mask] = -float('inf')
+        
+        _, top_m_indices = torch.topk(remaining_scores, k=min(top_m, mask.sum().item()), dim=0)
+        
+        # 合并: cls + 锚点 + top-m
+        selected = torch.cat([
+            torch.tensor([0], device=device),
+            anchor_indices[b],
+            top_m_indices
+        ])
+        
+        selected = torch.sort(selected)[0]
+        return selected
     
-    # 为每个transformer block注入剪枝逻辑
+    # 为每个ResidualAttentionBlock注入剪枝逻辑（在block层级而非attention层级）
     for i, block in enumerate(visual.transformer.resblocks):
-        original_forward = block.attn.forward
+        original_forward = block.forward
         original_forwards.append(original_forward)
         
         def make_custom_forward(orig_forward, layer_idx, block_ref):
-            def custom_forward(*args, **kwargs):
-                x = args[0] if len(args) > 0 else kwargs.get('x')
-                attn_mask = args[1] if len(args) > 1 else kwargs.get('attn_mask', None)
-                
+            def custom_forward(x, attn_mask=None):
                 # 如果启用剪枝且不是第一层，先进行token选择
                 if enable_pruning and layer_idx > 0:
-                    seq_len, batch_size, embed_dim = x.shape
-                    
-                    # 计算注意力权重用于token选择
                     with torch.no_grad():
-                        qkv = torch.nn.functional.linear(x, block_ref.attn.in_proj_weight, block_ref.attn.in_proj_bias)
-                        qkv = qkv.reshape(seq_len, batch_size, 3, block_ref.attn.num_heads, embed_dim // block_ref.attn.num_heads)
-                        qkv = qkv.permute(2, 1, 3, 0, 4)
-                        q, k, v = qkv[0], qkv[1], qkv[2]
-                        
-                        scale = (embed_dim // block_ref.attn.num_heads) ** -0.5
-                        attn = torch.matmul(q, k.transpose(-2, -1)) * scale
-                        
-                        # 注意：这里不应用attn_mask，因为我们需要基于原始注意力选择token
-                        attn_weights = torch.nn.functional.softmax(attn, dim=-1)
-                        
                         # 选择要保留的token
-                        selected_indices_list = select_tokens_by_pruning(
-                            x, attn_weights, k_anchors, top_m, alpha, x.device
+                        selected_idx = select_tokens_by_pruning(
+                            x, block_ref.attn, k_anchors, top_m, alpha, x.device
                         )
                         
-                        # 使用第一个batch的选择应用到所有batch
-                        selected_idx = selected_indices_list[0]
-                        x_pruned = x[selected_idx, :, :]
+                        # 剪枝x
+                        x = x[selected_idx, :, :]
                         
                         # 剪枝attn_mask
-                        attn_mask_pruned = None
                         if attn_mask is not None:
                             if attn_mask.dim() == 2:
-                                # [seq_len, seq_len]
-                                attn_mask_pruned = attn_mask[selected_idx][:, selected_idx]
+                                attn_mask = attn_mask[selected_idx][:, selected_idx]
                             elif attn_mask.dim() == 4:
-                                # [1, 1, seq_len, seq_len] or [batch, heads, seq_len, seq_len]
-                                attn_mask_pruned = attn_mask[:, :, selected_idx][:, :, :, selected_idx]
-                            else:
-                                # 其他情况
-                                attn_mask_pruned = attn_mask[..., selected_idx, :][..., selected_idx]
-                        
-                        # 使用剪枝后的x和attn_mask调用原始forward
-                        if len(args) > 1:
-                            new_args = (x_pruned, attn_mask_pruned) + args[2:]
-                            return orig_forward(*new_args, **{k: v for k, v in kwargs.items() if k != 'attn_mask'})
-                        else:
-                            new_kwargs = kwargs.copy()
-                            if attn_mask_pruned is not None:
-                                new_kwargs['attn_mask'] = attn_mask_pruned
-                            return orig_forward(x_pruned, **new_kwargs)
+                                attn_mask = attn_mask[:, :, selected_idx][:, :, :, selected_idx]
                 
-                # 不剪枝，直接调用原始forward
-                return orig_forward(*args, **kwargs)
+                # 调用原始forward
+                return orig_forward(x, attn_mask=attn_mask)
             return custom_forward
         
-        block.attn.forward = make_custom_forward(original_forward, i, block)
+        block.forward = make_custom_forward(original_forward, i, block)
     
     # 返回恢复函数
     def restore_model():
         for i, block in enumerate(visual.transformer.resblocks):
-            block.attn.forward = original_forwards[i]
+            block.forward = original_forwards[i]
     
     return restore_model
 
