@@ -41,8 +41,8 @@ python - <<EOF
 import json
 import os
 
-baseline_file = "${OUTPUT_DIR}/cifar10_openai_ViT-B-32_en_zeroshot_classification_baseline.json"
-token_selection_file = "${OUTPUT_DIR}/cifar10_openai_ViT-B-32_en_zeroshot_classification_token_selection.json"
+baseline_file = "${OUTPUT_DIR}/cifar10_openai_ViT-L-14_en_zeroshot_classification_baseline.json"
+token_selection_file = "${OUTPUT_DIR}/cifar10_openai_ViT-L-14_en_zeroshot_classification_token_selection.json"
 
 print("\n对比结果：")
 print("=" * 80)
