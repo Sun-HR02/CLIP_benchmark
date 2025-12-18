@@ -66,6 +66,8 @@ def get_parser_args():
     parser_eval.add_argument('--skip_existing', default=False, action="store_true", help="whether to skip an evaluation if the output file exists.")
     parser_eval.add_argument('--model_type', default="open_clip", type=str, choices=MODEL_TYPES, help="clip model type")
     parser_eval.add_argument('--wds_cache_dir', default=None, type=str, help="optional cache directory for webdataset only")
+    parser_eval.add_argument('--extract_attention', default=False, action="store_true", help="whether to extract and save attention weights from vision encoder")
+    parser_eval.add_argument('--attention_output', default="attention_{dataset}_{pretrained}_{model}.pt", type=str, help="output file for attention weights")
     parser_eval.set_defaults(which='eval')
 
     parser_build = subparsers.add_parser('build', help='Build CSV from evaluations')
@@ -316,7 +318,45 @@ def run(args):
             verbose=args.verbose,
             save_clf=args.save_clf,
             load_clfs=args.load_clfs,
-        ) 
+        )
+        
+        # 提取注意力权重（如果需要）
+        if args.extract_attention:
+            if args.verbose:
+                print("Extracting attention weights from vision encoder...")
+            # 获取一个批次的图像
+            sample_images, _ = next(iter(dataloader))
+            if isinstance(sample_images, (tuple, list)):
+                sample_images = sample_images[0]
+            
+            # 提取注意力权重
+            attention_weights = get_vision_attention(model, sample_images, device=args.device)
+            
+            # 保存注意力权重
+            attention_output = args.attention_output.format(
+                model=args.model,
+                pretrained=pretrained_slug,
+                dataset=dataset_slug
+            )
+            
+            attention_data = {
+                'attention_weights': attention_weights,
+                'model': args.model,
+                'pretrained': args.pretrained,
+                'dataset': args.dataset,
+                'num_layers': len(attention_weights),
+                'shape_info': {
+                    'last_layer_shape': str(attention_weights[-1].shape) if attention_weights else None,
+                    'description': '[batch_size, num_heads, seq_len, seq_len]'
+                }
+            }
+            
+            torch.save(attention_data, attention_output)
+            if args.verbose:
+                print(f"Attention weights saved to: {attention_output}")
+                if attention_weights:
+                    print(f"Number of layers: {len(attention_weights)}")
+                    print(f"Last layer attention shape: {attention_weights[-1].shape}")
     elif task == "zeroshot_retrieval":
         metrics = zeroshot_retrieval.evaluate(
             model, 
@@ -439,6 +479,218 @@ def world_info_from_env():
             world_size = int(os.environ[v])
             break
     return local_rank, global_rank, world_size
+
+def get_vision_attention(model, images, device='cuda', enable_pruning=True, k_anchors=10, top_m=50, alpha=0.5):
+    """
+    从视觉编码器获取注意力矩阵，支持可选的token剪枝
+    
+    Args:
+        model: OpenCLIP 模型
+        images: 输入图像张量 [batch_size, 3, H, W]
+        device: 设备
+        enable_pruning: 是否启用token剪枝
+        k_anchors: 选择的锚点token数量
+        top_m: 最终保留的非锚点token数量
+        alpha: 重要性和多样性的权重平衡参数
+    
+    Returns:
+        attention_weights: List of attention tensors, 每层一个
+                          shape: [batch_size, num_heads, seq_len, seq_len]
+    """
+    # 访问视觉编码器
+    visual = model.visual
+    attention_weights = []
+    
+    def select_tokens_by_pruning(x, attn_weights, k_anchors, top_m, alpha):
+        """
+        基于注意力的token剪枝策略
+        
+        Args:
+            x: token特征 [seq_len, batch_size, embed_dim]
+            attn_weights: 注意力权重 [batch_size, num_heads, seq_len, seq_len]
+            k_anchors: 锚点数量
+            top_m: 保留的非锚点token数量
+            alpha: 重要性和多样性的权重
+            
+        Returns:
+            selected_indices: 选中的token索引 [batch_size, k_anchors + top_m]
+            pruned_x: 剪枝后的token特征
+        """
+        seq_len, batch_size, embed_dim = x.shape
+        
+        # 转换x的维度: [seq_len, batch_size, embed_dim] -> [batch_size, seq_len, embed_dim]
+        x_batch = x.permute(1, 0, 2)
+        
+        # 1. 使用cls token (第0个token) 的注意力选择k个锚点
+        # A_coarse = Softmax(x_cls * W_Q * (X * W_K)^T / sqrt(d))
+        # 这里直接使用已计算的注意力权重中cls token对其他token的注意力
+        # attn_weights: [batch_size, num_heads, seq_len, seq_len]
+        
+        # 平均所有注意力头的cls token注意力
+        cls_attention = attn_weights[:, :, 0, :].mean(dim=1)  # [batch_size, seq_len]
+        
+        # 排除cls token自身，选择top-k作为锚点
+        cls_attention_no_cls = cls_attention[:, 1:]  # [batch_size, seq_len-1]
+        _, anchor_indices_relative = torch.topk(cls_attention_no_cls, k=min(k_anchors, seq_len-1), dim=1)
+        anchor_indices = anchor_indices_relative + 1  # 加1因为排除了cls token
+        
+        # 2. 计算每个token与锚点的平均注意力 (重要性)
+        # I_i = (1/|S_anchor|) * sum(Attn(x_i, x_j)) for x_j in S_anchor
+        
+        # 获取所有token对所有token的平均注意力
+        avg_attn = attn_weights.mean(dim=1)  # [batch_size, seq_len, seq_len]
+        
+        importance_scores = []
+        diversity_scores = []
+        
+        for b in range(batch_size):
+            anchor_idx = anchor_indices[b]  # [k_anchors]
+            
+            # 计算重要性: 每个token对锚点的平均注意力
+            # avg_attn[b]: [seq_len, seq_len]
+            # 选择每个token对锚点的注意力
+            attn_to_anchors = avg_attn[b, :, anchor_idx]  # [seq_len, k_anchors]
+            importance = attn_to_anchors.mean(dim=1)  # [seq_len]
+            
+            # 3. 计算每个token与锚点的相似度 (多样性)
+            # Sim(x_i, S_anchor) = max(x_i · x_j / (|x_i|_2 * |x_j|_2)) for x_j in S_anchor
+            # D_i = 1 - Sim(x_i, S_anchor)
+            
+            # 归一化特征
+            x_norm = torch.nn.functional.normalize(x_batch[b], p=2, dim=1)  # [seq_len, embed_dim]
+            anchor_features = x_norm[anchor_idx]  # [k_anchors, embed_dim]
+            
+            # 计算余弦相似度
+            similarity = torch.matmul(x_norm, anchor_features.T)  # [seq_len, k_anchors]
+            max_similarity = similarity.max(dim=1)[0]  # [seq_len]
+            diversity = 1 - max_similarity  # [seq_len]
+            
+            importance_scores.append(importance)
+            diversity_scores.append(diversity)
+        
+        importance_scores = torch.stack(importance_scores)  # [batch_size, seq_len]
+        diversity_scores = torch.stack(diversity_scores)  # [batch_size, seq_len]
+        
+        # 4. 计算最终评分并选择top-m个token
+        # S_i = alpha * I_i + (1 - alpha) * D_i
+        final_scores = alpha * importance_scores + (1 - alpha) * diversity_scores
+        
+        # 排除cls token和已选择的锚点
+        selected_indices_list = []
+        for b in range(batch_size):
+            # 创建mask排除cls和锚点
+            mask = torch.ones(seq_len, dtype=torch.bool, device=final_scores.device)
+            mask[0] = False  # 排除cls
+            mask[anchor_indices[b]] = False  # 排除锚点
+            
+            # 在剩余token中选择top-m
+            remaining_scores = final_scores[b].clone()
+            remaining_scores[~mask] = -float('inf')
+            
+            _, top_m_indices = torch.topk(remaining_scores, k=min(top_m, mask.sum().item()), dim=0)
+            
+            # 合并: cls + 锚点 + top-m
+            selected = torch.cat([
+                torch.tensor([0], device=device),  # cls token
+                anchor_indices[b],  # 锚点
+                top_m_indices  # top-m tokens
+            ])
+            
+            # 排序以保持原始顺序
+            selected = torch.sort(selected)[0]
+            selected_indices_list.append(selected)
+        
+        # 由于不同batch可能选择不同数量的token，这里返回索引列表
+        return selected_indices_list
+    
+    def make_attention_hook(layer_idx):
+        """创建一个闭包来捕获特定层的注意力权重"""
+        def hook(module, input, output):
+            # 在 MultiheadAttention 中，我们需要手动计算或捕获注意力权重
+            # OpenCLIP 的注意力层通常不直接返回注意力权重
+            # 我们需要在 forward 过程中捕获 Q, K, V
+            pass
+        return hook
+    
+    # 更好的方法：直接修改前向传播来获取注意力权重
+    def attention_forward_hook(module, input, output):
+        """捕获注意力模块的输出"""
+        # 对于 nn.MultiheadAttention，需要在调用时设置 need_weights=True
+        # 但 OpenCLIP 可能没有直接暴露这个选项
+        # 我们需要手动计算注意力权重
+        pass
+    
+    # 注册 hook 到每个 transformer block 的注意力层
+    hooks = []
+    original_forwards = []
+    
+    # 保存原始的 forward 方法并替换为自定义版本
+    for i, block in enumerate(visual.transformer.resblocks):
+        # 保存原始 forward
+        original_forward = block.attn.forward
+        original_forwards.append(original_forward)
+        
+        def make_custom_forward(orig_forward, layer_idx):
+            def custom_forward(x, attn_mask=None):
+                # 手动计算注意力权重
+                # x shape: [seq_len, batch_size, embed_dim]
+                seq_len, batch_size, embed_dim = x.shape
+                
+                # 获取 Q, K, V
+                qkv = torch.nn.functional.linear(x, block.attn.in_proj_weight, block.attn.in_proj_bias)
+                qkv = qkv.reshape(seq_len, batch_size, 3, block.attn.num_heads, embed_dim // block.attn.num_heads)
+                qkv = qkv.permute(2, 1, 3, 0, 4)  # [3, batch, heads, seq_len, head_dim]
+                q, k, v = qkv[0], qkv[1], qkv[2]
+                
+                # 计算注意力权重
+                scale = (embed_dim // block.attn.num_heads) ** -0.5
+                attn = torch.matmul(q, k.transpose(-2, -1)) * scale  # [batch, heads, seq_len, seq_len]
+                
+                if attn_mask is not None:
+                    attn = attn + attn_mask
+                
+                attn_weights = torch.nn.functional.softmax(attn, dim=-1)
+                attention_weights.append(attn_weights.detach().cpu())
+                
+                # 如果启用剪枝，在前向传播中进行token选择
+                if enable_pruning and layer_idx > 0:  # 第一层不剪枝
+                    with torch.no_grad():
+                        selected_indices_list = select_tokens_by_pruning(
+                            x, attn_weights.detach(), k_anchors, top_m, alpha
+                        )
+                        
+                        # 对每个batch进行token选择
+                        pruned_x_list = []
+                        for b in range(batch_size):
+                            selected_idx = selected_indices_list[b]
+                            pruned_x_list.append(x[selected_idx, b, :])
+                        
+                        # 由于不同batch可能有不同数量的token，需要padding
+                        # 这里简化处理：使用第一个batch的选择应用到所有batch
+                        # 实际应用中可能需要更复杂的处理
+                        selected_idx = selected_indices_list[0]
+                        x_pruned = x[selected_idx, :, :]
+                        
+                        # 使用剪枝后的x继续前向传播
+                        return orig_forward(x_pruned, attn_mask)
+                
+                # 调用原始 forward
+                return orig_forward(x, attn_mask)
+            return custom_forward
+        
+        # 替换 forward 方法
+        block.attn.forward = make_custom_forward(original_forward, i)
+    
+    # 前向传播
+    with torch.no_grad():
+        images = images.to(device)
+        _ = visual(images)
+    
+    # 恢复原始 forward 方法
+    for i, block in enumerate(visual.transformer.resblocks):
+        block.attn.forward = original_forwards[i]
+    
+    return attention_weights
 
 
 if __name__ == "__main__":
