@@ -11,6 +11,7 @@ echo "=========================================="
 python -m clip_benchmark.cli eval \
     --dataset cifar10 \
     --model ViT-L-14 \
+    --task "zeroshot_retrieval" \
     --pretrained openai \
     --dataset_root "https://huggingface.co/datasets/clip-benchmark/wds_{dataset_cleaned}/tree/main" \
     --output "${OUTPUT_DIR}/cifar10_openai_ViT-L-14_en_zeroshot_classification_baseline.json"
@@ -23,6 +24,7 @@ echo "=========================================="
 python -m clip_benchmark.cli eval \
     --dataset cifar10 \
     --model ViT-L-14 \
+    --task "zeroshot_retrieval" \
     --pretrained openai \
     --dataset_root "https://huggingface.co/datasets/clip-benchmark/wds_{dataset_cleaned}/tree/main" \
     --enable_token_selection \
