@@ -27,7 +27,7 @@ python -m clip_benchmark.cli eval \
     --dataset_root "https://huggingface.co/datasets/clip-benchmark/wds_{dataset_cleaned}/tree/main" \
     --enable_token_selection \
     --token_selection_k 15 \
-    --token_selection_m 150 \
+    --token_selection_m 170 \
     --token_selection_alpha 0 \
     --output "${OUTPUT_DIR}/cifar10_openai_ViT-L-14_en_zeroshot_classification_token_selection.json"
 
