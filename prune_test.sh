@@ -10,5 +10,5 @@ python3 clip_benchmark/cli.py eval \
   # --attention_output "my_attention_weights.pt" \
   --enable_pruning \
   --k_anchors 10 \
-  --top_m 250 \
+  --top_m 50 \
   --alpha 0.5
