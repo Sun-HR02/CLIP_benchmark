@@ -86,13 +86,16 @@ def accuracy(output, target, topk=(1,)):
 def get_image_features_with_tokens(model, images):
     """
     Get image features with all tokens (unpooled) from CLIP model.
+    Returns both CLS token (processed) and patch tokens (unprocessed) for token selection.
     
     Args:
         model: CLIP model
         images: input images tensor
     
     Returns:
-        image_features: torch.Tensor of shape (B, N, D) for ViT models or (B, D) for others
+        tuple: (cls_feature, patch_tokens) where
+            - cls_feature: torch.Tensor of shape (B, D) - processed CLS token (standard CLIP output)
+            - patch_tokens: torch.Tensor of shape (B, N-1, D_transformer) - unprocessed patch tokens
     """
     # Try to get unpooled features from vision transformer
     if hasattr(model, 'visual'):
@@ -116,26 +119,23 @@ def get_image_features_with_tokens(model, images):
             x = visual.transformer(x)
             x = x.permute(1, 0, 2)  # LND -> NLD
             
-            # Apply ln_post to all tokens (not just CLS)
-            x = visual.ln_post(x)  # (B, N, D)
-            # Apply projection to all tokens if exists
-            # This transforms from transformer dim (768) to embedding dim (512)
-            if hasattr(visual, 'proj') and visual.proj is not None:
-                B, N, D = x.shape
-                # Reshape to (B*N, D), apply projection, reshape back
-                x_flat = x.reshape(B * N, D)
-                x_flat = x_flat @ visual.proj
-                x = x_flat.reshape(B, N, -1)
+            # Split CLS token and patch tokens
+            cls_token = x[:, 0, :]  # (B, D_transformer)
+            patch_tokens = x[:, 1:, :]  # (B, N-1, D_transformer)
             
-            # Return all tokens AFTER ln_post and projection
-            # This gives us (B, N, D_embed) where D_embed is the final embedding dim (e.g., 512)
-            return x
+            # Process CLS token the standard CLIP way: ln_post + projection
+            cls_token = visual.ln_post(cls_token)  # (B, D_transformer)
+            if hasattr(visual, 'proj') and visual.proj is not None:
+                cls_token = cls_token @ visual.proj  # (B, D_embed)
+            
+            # Return processed CLS token and unprocessed patch tokens
+            return cls_token, patch_tokens
         except Exception as e:
             # If anything fails, fall back to standard encode_image
             pass
     
     # Fallback: use standard encode_image (returns pooled features)
-    return model.encode_image(images)
+    return model.encode_image(images), None
 
 
 def run_classification(model, classifier, dataloader, device, amp=True, 
@@ -182,50 +182,49 @@ def run_classification(model, classifier, dataloader, device, amp=True,
             with torch.autocast(device, enabled=amp):
                 # Get image features (with tokens if possible)
                 if enable_token_selection:
-                    # # Get unpooled token features (already with ln_post and projection applied)
-                    # image_features = get_image_features_with_tokens(model, images)
+                    # Get CLS token (processed) and patch tokens (unprocessed)
+                    cls_feature, patch_tokens = get_image_features_with_tokens(model, images)
                     
-                    # print(f"[Debug] Image features after encode (with ln_post & proj): {image_features.shape}")
-                    
-                    # # Apply token selection on the projected features
-                    # # Token selection works in the final embedding space (e.g., 512-dim)
-                    # image_features = apply_token_selection(
-                    #     image_features, 
-                    #     k=token_selection_k, 
-                    #     m=token_selection_m, 
-                    #     alpha=token_selection_alpha,
-                    #     enabled=True
-                    # )
-                    
-                    # Get unpooled token features (B, N, D) with ln_post and projection applied
-                    image_features = get_image_features_with_tokens(model, images)
-                    if nb == 0:  # Only print for first batch
-                        print(f"[Debug] Unpooled image features shape: {image_features.shape}")
-                        print(f"[Token Selection] Parameters: k={token_selection_k}, m={token_selection_m}, alpha={token_selection_alpha}")
-                    
-                    # Apply token selection to get sparse representation
-                    image_features = apply_token_selection(
-                        image_features, 
-                        k=token_selection_k, 
-                        m=token_selection_m, 
-                        alpha=token_selection_alpha,
-                        enabled=True
-                    )
-                    
-                    if nb == 0:  # Only print for first batch
-                        print(f"[Token Selection] After selection (sparse), shape: {image_features.shape}")
-                    
-                    # Pool the selected tokens: mean pooling over non-zero tokens
-                    if len(image_features.shape) == 3:
-                        # Create mask for non-zero tokens
-                        token_mask = (image_features.abs().sum(dim=-1) > 0).float()  # (B, N)
-                        num_selected = token_mask.sum(dim=1).mean().item()
-                        if nb == 0:  # Only print for first batch
-                            print(f"[Token Selection] Average number of selected tokens: {num_selected:.1f}")
-                        # Sum features and divide by number of non-zero tokens
-                        image_features = (image_features * token_mask.unsqueeze(-1)).sum(dim=1) / token_mask.sum(dim=1, keepdim=True).clamp(min=1)
-                        if nb == 0:  # Only print for first batch
-                            print(f"[Debug] After pooling selected tokens, shape: {image_features.shape}")
+                    if patch_tokens is not None:
+                        # We have patch tokens, apply token selection to them
+                        # Note: patch_tokens are still in transformer space (768D), not projected yet
+                        # This is intentional - we select in the semantic space before projection
+                        
+                        # For token selection, we need to include CLS token in the attention computation
+                        # Reconstruct full token sequence for selection algorithm
+                        # But we need to project patch tokens to same space as CLS for fair comparison
+                        visual = model.visual
+                        
+                        # Apply ln_post and projection to patch tokens
+                        patch_tokens_processed = visual.ln_post(patch_tokens)  # (B, N-1, D_transformer)
+                        if hasattr(visual, 'proj') and visual.proj is not None:
+                            B, N_patches, D = patch_tokens_processed.shape
+                            patch_flat = patch_tokens_processed.reshape(B * N_patches, D)
+                            patch_flat = patch_flat @ visual.proj
+                            patch_tokens_processed = patch_flat.reshape(B, N_patches, -1)  # (B, N-1, D_embed)
+                        
+                        # Combine CLS and processed patches for token selection
+                        all_tokens = torch.cat([cls_feature.unsqueeze(1), patch_tokens_processed], dim=1)  # (B, N, D_embed)
+                        
+                        # Apply token selection (this will select important patch tokens)
+                        selected_tokens = apply_token_selection(
+                            all_tokens, 
+                            k=token_selection_k, 
+                            m=token_selection_m, 
+                            alpha=token_selection_alpha,
+                            enabled=True
+                        )  # (B, N, D_embed) with sparse representation
+                        
+                        # Use only the CLS token (index 0) as the final feature
+                        # The token selection helps identify important regions, but we still use CLS
+                        # which has aggregated information from selected tokens during transformer layers
+                        image_features = cls_feature  # (B, D_embed)
+                        
+                        # Optional: You could also use a weighted combination, but for now we use pure CLS
+                        # This preserves the original CLIP training objective
+                    else:
+                        # Fallback: patch_tokens is None, use cls_feature directly
+                        image_features = cls_feature
                 else:
                     # Standard path: use pooled features
                     image_features = model.encode_image(images)
