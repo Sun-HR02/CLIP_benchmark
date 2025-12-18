@@ -10,6 +10,7 @@ import torch.nn.functional as F
 from tqdm import tqdm
 
 from sklearn.metrics import classification_report, balanced_accuracy_score
+from .token_pruning import apply_pruning_to_model
 
 
 
@@ -82,7 +83,7 @@ def accuracy(output, target, topk=(1,)):
     return [float(correct[:k].reshape(-1).float().sum(0, keepdim=True).cpu().numpy()) / n for k in topk]
 
 
-def run_classification(model, classifier, dataloader, device, amp=True):
+def run_classification(model, classifier, dataloader, device, amp=True, pruning_config=None):
     """
     Run zero-shot classifcation
 
@@ -92,7 +93,13 @@ def run_classification(model, classifier, dataloader, device, amp=True):
     classifier: torch.Tensor
         obtained from the function `zero_shot_classifier`
     
-    dataloader: torch.utils.data.Dataloader 
+    dataloader: torch.utils.data.Dataloader
+    
+    pruning_config: dict or None
+        if not None, apply token pruning with config:
+        - k_anchors: number of anchor tokens
+        - top_m: number of top-m tokens to keep
+        - alpha: balance between importance and diversity
     
     Returns
     -------
@@ -102,7 +109,7 @@ def run_classification(model, classifier, dataloader, device, amp=True):
     """
     pred = []
     true = []
-    nb = 0
+    
     with torch.no_grad():
         for images, target in tqdm(dataloader):
             images = images.to(device)
@@ -162,7 +169,7 @@ def average_precision_per_class(scores, targets):
     return ap
 
 
-def evaluate(model, dataloader, tokenizer, classnames, templates, device, amp=True, verbose=False, save_clf=None, load_clfs=[]):
+def evaluate(model, dataloader, tokenizer, classnames, templates, device, amp=True, verbose=False, save_clf=None, load_clfs=[], pruning_config=None):
     """
     Run zero-shot classification and evaluate the metrics
 
@@ -187,6 +194,9 @@ def evaluate(model, dataloader, tokenizer, classnames, templates, device, amp=Tr
     amp: whether to use automatic mixed precision
 
     verbose: whether to use verbose model
+    
+    pruning_config: dict or None
+        if not None, apply token pruning with config
 
     Returns
     -------
@@ -205,8 +215,20 @@ def evaluate(model, dataloader, tokenizer, classnames, templates, device, amp=Tr
     if save_clf is not None:
         torch.save(classifier, save_clf)
         # exit() - not sure if we want to exit here or not.
+    
+    # 如果启用剪枝，在评估前应用到模型
+    if pruning_config is not None:
+        if verbose:
+            print(f"Applying token pruning: k_anchors={pruning_config['k_anchors']}, "
+                  f"top_m={pruning_config['top_m']}, alpha={pruning_config['alpha']}")
+        apply_pruning_to_model(
+            model,
+            k_anchors=pruning_config['k_anchors'],
+            top_m=pruning_config['top_m'],
+            alpha=pruning_config['alpha']
+        )
 
-    logits, target = run_classification(model, classifier, dataloader, device, amp=amp)
+    logits, target = run_classification(model, classifier, dataloader, device, amp=amp, pruning_config=pruning_config)
     is_multilabel = (len(target.shape) == 2)
 
     if is_multilabel:
