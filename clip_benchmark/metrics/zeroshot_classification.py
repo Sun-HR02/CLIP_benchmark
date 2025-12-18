@@ -164,7 +164,6 @@ def run_classification(model, classifier, dataloader, device, amp=True,
     nb = 0
     with torch.no_grad():
         for images, target in tqdm(dataloader):
-            import ipdb;ipdb.set_trace()
 
             images = images.to(device)
             target = target.to(device)
@@ -213,6 +212,7 @@ def run_classification(model, classifier, dataloader, device, amp=True,
                 else:
                     # Standard path: use pooled features
                     image_features = model.encode_image(images)
+                    import ipdb;ipdb.set_trace()
                 
                 image_features = F.normalize(image_features, dim=-1)
                 logits = 100. * image_features @ classifier
