@@ -104,7 +104,7 @@ def get_image_features_with_tokens(model, images):
             # Encode patches
             x = visual.conv1(images)  # shape = [*, width, grid, grid]
             x = x.reshape(x.shape[0], x.shape[1], -1)  # shape = [*, width, grid ** 2]
-            x = x.permute(0, 2, 1)  # shape = [*, grid ** 2, width]
+            x = x.permute(0, 2, 1)  # shape = [*, grid ** 2, width] [64,49,768]
             
             # Add class token
             x = torch.cat([visual.class_embedding.to(x.dtype) + torch.zeros(x.shape[0], 1, x.shape[-1], dtype=x.dtype, device=x.device), x], dim=1)  # shape = [*, grid ** 2 + 1, width]
@@ -118,7 +118,6 @@ def get_image_features_with_tokens(model, images):
             
             # Apply ln_post to all tokens (not just CLS)
             x = visual.ln_post(x)  # (B, N, D)
-            import ipdb;ipdb.set_trace()
             # Apply projection to all tokens if exists
             # This transforms from transformer dim (768) to embedding dim (512)
             if hasattr(visual, 'proj') and visual.proj is not None:
@@ -201,7 +200,7 @@ def run_classification(model, classifier, dataloader, device, amp=True,
                     # Get unpooled token features (B, N, D) with ln_post and projection applied
                     image_features = get_image_features_with_tokens(model, images)
                     print(f"[Debug] Unpooled image features shape: {image_features.shape}")
-                    
+                    import ipdb;ipdb.set_trace()
                     # Apply token selection to get sparse representation
                     image_features = apply_token_selection(
                         image_features, 
