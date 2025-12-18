@@ -116,8 +116,20 @@ def get_image_features_with_tokens(model, images):
             x = visual.transformer(x)
             x = x.permute(1, 0, 2)  # LND -> NLD
             
-            # Return all tokens WITHOUT final layer norm and pooling
-            # This gives us (B, N, D) where N = grid**2 + 1 (including CLS token)
+            # Apply ln_post to all tokens (not just CLS)
+            x = visual.ln_post(x)  # (B, N, D)
+            
+            # Apply projection to all tokens if exists
+            # This transforms from transformer dim (768) to embedding dim (512)
+            if hasattr(visual, 'proj') and visual.proj is not None:
+                B, N, D = x.shape
+                # Reshape to (B*N, D), apply projection, reshape back
+                x_flat = x.reshape(B * N, D)
+                x_flat = x_flat @ visual.proj
+                x = x_flat.reshape(B, N, -1)
+            
+            # Return all tokens AFTER ln_post and projection
+            # This gives us (B, N, D_embed) where D_embed is the final embedding dim (e.g., 512)
             return x
         except Exception as e:
             # If anything fails, fall back to standard encode_image
@@ -171,29 +183,13 @@ def run_classification(model, classifier, dataloader, device, amp=True,
             with torch.autocast(device, enabled=amp):
                 # Get image features (with tokens if possible)
                 if enable_token_selection:
-                    # Get unpooled token features for token selection
+                    # Get unpooled token features (already with ln_post and projection applied)
                     image_features = get_image_features_with_tokens(model, images)
                     
-                    print(f"[Debug] Unpooled image features shape: {image_features.shape}")
-                    
-                    # Apply layer norm to all tokens BEFORE token selection
-                    # This is important because token selection should work on normalized features
-                    if len(image_features.shape) == 3:
-                        if hasattr(model, 'visual') and hasattr(model.visual, 'ln_post'):
-                            image_features = model.visual.ln_post(image_features)
-                            print(f"[Debug] After ln_post, shape: {image_features.shape}")
-                        
-                        # Apply projection to each token if exists
-                        # This transforms from transformer dim (768) to embedding dim (512)
-                        if hasattr(model, 'visual') and hasattr(model.visual, 'proj') and model.visual.proj is not None:
-                            B, N, D = image_features.shape
-                            # Reshape to (B*N, D), apply projection, reshape back
-                            image_features_flat = image_features.reshape(B * N, D)
-                            image_features_flat = image_features_flat @ model.visual.proj
-                            image_features = image_features_flat.reshape(B, N, -1)
-                            print(f"[Debug] After projection to each token, shape: {image_features.shape}")
+                    print(f"[Debug] Image features after encode (with ln_post & proj): {image_features.shape}")
                     
                     # Apply token selection on the projected features
+                    # Token selection works in the final embedding space (e.g., 512-dim)
                     image_features = apply_token_selection(
                         image_features, 
                         k=token_selection_k, 
