@@ -200,7 +200,7 @@ def run_classification(model, classifier, dataloader, device, amp=True,
                     # Get unpooled token features (B, N, D) with ln_post and projection applied
                     image_features = get_image_features_with_tokens(model, images)
                     print(f"[Debug] Unpooled image features shape: {image_features.shape}")
-                    import ipdb;ipdb.set_trace()
+                    # import ipdb;ipdb.set_trace()
                     # Apply token selection to get sparse representation
                     image_features = apply_token_selection(
                         image_features, 
