@@ -118,7 +118,7 @@ def get_image_features_with_tokens(model, images):
             
             # Apply ln_post to all tokens (not just CLS)
             x = visual.ln_post(x)  # (B, N, D)
-            
+            import ipdb;ipdb.set_trace()
             # Apply projection to all tokens if exists
             # This transforms from transformer dim (768) to embedding dim (512)
             if hasattr(visual, 'proj') and visual.proj is not None:
